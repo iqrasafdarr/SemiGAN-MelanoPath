@@ -1,23 +1,45 @@
-__pycache__/
-*.py[cod]
-.venv/
-venv/
-.env
+# Data
+data/BreakHis/
+data/MHIST/
+*.png
+*.jpg
+*.jpeg
 
-.vscode/
+# Results
+runs/
+*.csv
+*.json
+*.txt
+SUMMARY_*.txt
 
+# Checkpoints
+checkpoints/
 *.pt
 *.pth
-*.ckpt
 
-data/raw/
-data/processed/
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+*.egg
 
-results/
-runs/
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
 
+# Jupyter
 .ipynb_checkpoints/
+*.ipynb
 
-*.log
+# OS
 .DS_Store
-Thumbs.db
+*.log
+
+# Virtual environment
+venv/
+env/
