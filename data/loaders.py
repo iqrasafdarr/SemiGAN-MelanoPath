@@ -1,4 +1,4 @@
-import os
+﻿import os
 import re
 import numpy as np
 import torch
@@ -34,7 +34,7 @@ class BreakHisDataset(Dataset):
             
             # Extract patient ID (e.g., "SOB_B_A-14-13411B" from folder name)
             patient_id = patient_dir.split('/')[0]
-            label = 0 if 'B' in patient_id else 1  # B=benign, M=malignant
+            label = 0 if patient_id.startswith('SOB_B_') else 1  # B=benign, M=malignant
             
             for mag in ['40X', '100X', '200X', '400X']:
                 mag_dir = os.path.join(patient_path, mag)
@@ -168,36 +168,76 @@ class MHISTDataset(Dataset):
 
 def get_train_val_split(dataset, label_pct=100, seed=42):
     """
-    Split dataset into labeled/unlabeled using GroupShuffleSplit.
-    Stratifies by class, groups by patient ID.
+    Patient-level labeled/unlabeled split with class-balanced sampling.
+
+    Every patient remains entirely in either the labeled or unlabeled set.
+    For label_pct < 100, patients are sampled independently within each
+    class so both benign and malignant classes are represented.
     """
     samples = dataset.samples
-    patient_ids = np.array([s['patient_id'] for s in samples])
-    labels = np.array([s['label'] for s in samples])
-    
-    # Group by patient
-    unique_patients = np.unique(patient_ids)
-    patient_labels = np.array([labels[patient_ids == p][0] for p in unique_patients])
-    
-    # Stratified split by class at patient level
-    n_labeled = max(1, int(len(unique_patients) * label_pct / 100))
-    
-    splitter = StratifiedShuffleSplit(n_splits=1, test_size=1-label_pct/100, 
-                                      random_state=seed)
-    labeled_patients_idx, unlabeled_patients_idx = next(
-        splitter.split(unique_patients, patient_labels)
+
+    if label_pct >= 100:
+        labeled_indices = np.arange(len(samples), dtype=int)
+        return {
+            'labeled_indices': labeled_indices,
+            'unlabeled_indices': np.array([], dtype=int),
+            'n_labeled': len(labeled_indices),
+            'n_unlabeled': 0
+        }
+
+    patient_to_indices = {}
+
+    for idx, sample in enumerate(samples):
+        patient_to_indices.setdefault(sample['patient_id'], []).append(idx)
+
+    patient_to_label = {
+        patient_id: samples[indices[0]]['label']
+        for patient_id, indices in patient_to_indices.items()
+    }
+
+    rng = np.random.RandomState(seed)
+
+    labeled_patients = set()
+    unlabeled_patients = set()
+
+    for label in sorted(set(patient_to_label.values())):
+
+        class_patients = [
+            patient_id
+            for patient_id, patient_label in patient_to_label.items()
+            if patient_label == label
+        ]
+
+        rng.shuffle(class_patients)
+
+        n_labeled = int(round(len(class_patients) * label_pct / 100))
+
+        # At least one patient from each class.
+        n_labeled = max(1, n_labeled)
+
+        # Keep at least one patient in the unlabeled pool.
+        if len(class_patients) > 1:
+            n_labeled = min(n_labeled, len(class_patients) - 1)
+
+        labeled_patients.update(class_patients[:n_labeled])
+        unlabeled_patients.update(class_patients[n_labeled:])
+
+    labeled_indices = np.array(
+        [
+            idx for idx, sample in enumerate(samples)
+            if sample['patient_id'] in labeled_patients
+        ],
+        dtype=int
     )
-    
-    labeled_patients = unique_patients[labeled_patients_idx]
-    unlabeled_patients = unique_patients[unlabeled_patients_idx]
-    
-    # Map back to image indices
-    labeled_mask = np.isin(patient_ids, labeled_patients)
-    unlabeled_mask = np.isin(patient_ids, unlabeled_patients)
-    
-    labeled_indices = np.where(labeled_mask)[0]
-    unlabeled_indices = np.where(unlabeled_mask)[0]
-    
+
+    unlabeled_indices = np.array(
+        [
+            idx for idx, sample in enumerate(samples)
+            if sample['patient_id'] in unlabeled_patients
+        ],
+        dtype=int
+    )
+
     return {
         'labeled_indices': labeled_indices,
         'unlabeled_indices': unlabeled_indices,
@@ -228,3 +268,4 @@ def create_loaders(dataset, labeled_indices, unlabeled_indices, batch_size=32):
     )
     
     return labeled_loader, unlabeled_loader
+

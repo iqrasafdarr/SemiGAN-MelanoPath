@@ -25,6 +25,7 @@ class Generator(nn.Module):
                  use_spectral_norm=True):
         super().__init__()
         self.z_dim = z_dim
+        self.base_channels = base_channels
         
         self.fc = nn.Linear(z_dim, base_channels * 8 * 4 * 4)
         
@@ -61,8 +62,7 @@ class Generator(nn.Module):
     
     def forward(self, z):
         x = self.fc(z)
-        x = x.view(-1, self.z_dim // 4 + 8, 4, 4)  # Reshape to 4D
-        x = x.view(-1, 256, 4, 4)  # Fixed reshape
+        x = x.view(-1, self.base_channels * 8, 4, 4)
         x = self.conv_layers(x)
         return x
 
