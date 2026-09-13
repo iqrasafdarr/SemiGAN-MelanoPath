@@ -1,267 +1,369 @@
 # SemiGAN-MelanoPath v2
 
-**Semi-supervised GAN with Consistency Regularization & Self-Supervision for Histopathology Cancer Detection Under Extreme Label Scarcity**
+### Semi-Supervised GAN with Consistency Regularization and Self-Supervision for Histopathology Cancer Detection Under Extreme Label Scarcity
 
-**MITACS 54710** | Cross-domain validation | Production-ready code
+[![Python](https://img.shields.io/badge/Python-3.11-blue.svg)](https://www.python.org/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.x-ee4c2c.svg)](https://pytorch.org/)
+[![Dataset](https://img.shields.io/badge/Dataset-BreakHis-green.svg)]()
+[![Task](https://img.shields.io/badge/Task-Histopathology%20Classification-purple.svg)]()
+[![Learning](https://img.shields.io/badge/Learning-Semi--Supervised-orange.svg)]()
+[![Status](https://img.shields.io/badge/Status-Research%20In%20Progress-yellow.svg)]()
 
----
-
-## 📋 Overview
-
-SemiGAN-MelanoPath v2 is a research-grade semi-supervised GAN designed for histopathological melanoma classification under extreme label constraints. By combining **Virtual Adversarial Training (VAT)**, **self-supervised rotation prediction**, and **dual-head discriminator architecture**, the method achieves competitive performance with only 1% labeled data while maintaining strong cross-domain transfer capabilities.
-
-**Key Innovation**: VAT-regularized discriminator ensures consistency on unlabeled data, while rotation SSL provides feature learning signal independent of class labels.
-
----
-
-## 🏗️ Architecture
-
-### Generator
-```
-z (100-dim) → FC(256) → DeconvBlock (4x4 → 128x128)
-- Spectral normalization on all conv layers
-- BatchNorm + ReLU activations
-- Final tanh output: [-1, 1] image range
-```
-
-### Discriminator (Dual-Head)
-```
-Input (128x128) → ConvBlock (128 → 512 channels) → GAP → (B, 512)
-                 ↙ Head A (Classification)          ↘ Head B (Real/Fake)
-         K-class logits + Rotation head          Binary logits (1-dim)
-         (Dropout enabled during inference)      (Gradient-based training)
-```
-
-**Head A (Classification)**:
-- K-class classifier: benign (0), malignant (1)
-- Dropout p=0.5 enabled during MC-Dropout inference
-- Rotation branch: 4-way classification (0°, 90°, 180°, 270°)
-- Trained on **all** data (labeled + unlabeled)
-
-**Head B (Real/Fake)**:
-- Binary discrimination: real (1) vs generated (0)
-- Shared feature extractor with spectral norm
+> **Note on the name:** "MelanoPath" is the project's codename. The dataset and task are breast-cancer **histopathology** classification (BreakHis) — not melanoma. This README describes the task accurately as histopathology cancer detection throughout.
 
 ---
 
-## 🎯 Loss Function Design
+## Table of Contents
 
-### Discriminator Loss
-L_D = L_CE^labeled + λ_r L_CE^rotation + λ_a L_BCE^adv + λ_v L_VAT
-
-| Loss Component | Weight | Purpose |
-|---|---|---|
-| Supervised CE (labeled) | 1.0 | Learn discriminative features from labels |
-| Rotation SSL (all data) | 0.5 | Unsupervised representation learning |
-| Adversarial/GAN | 1.0 | Realistic fake generation |
-| VAT (unlabeled) | **3.0** | Consistency regularization (KEY!) |
-
-### Generator Loss
-L_G = λ_f L_FM + λ_a L_BCE^adv
-- Feature Matching: Match mean D features of fake vs real (stability)
-- Adversarial: Fool discriminator real/fake head
-
----
-
-## 🔑 Semi-Supervised Mechanisms
-
-### 1. Virtual Adversarial Training (VAT)
-For unlabeled sample x, find perturbation r maximizing KL[p(x) || p(x+r)]:
-- Power iteration to find worst-case perturbation
-- Consistency loss: KL[p(x) || p(x+r_adv)]
-- Effect: Forces decision boundary away from unlabeled regions
-
-### 2. Self-Supervised Rotation Prediction
-- Create 4 rotations: {x, R_90(x), R_180(x), R_270(x)}
-- Train 4-way classifier independent of labels
-- Effect: Learn rotation-invariant features from all data
-
-### 3. Feature Matching (Generator Stability)
-- L_FM = || E[f_D(G(z))] - E[f_D(x)] ||_2^2
-- Effect: Match discriminator feature distributions
-
-### 4. Input Noise Injection (Discriminator Regularization)
-- Add Gaussian noise σ=0.05 to D input
-- Effect: Improve robustness to adversarial examples
+- [Overview](#overview)
+- [Research Question](#research-question)
+- [Key Highlights](#key-highlights)
+- [Methodology](#methodology)
+- [Dataset & Patient-Level Splitting](#dataset--patient-level-splitting)
+- [Extreme Label Scarcity](#extreme-label-scarcity)
+- [Experimental Framework (E1–E5)](#experimental-framework-e1e5)
+- [Results](#results)
+- [Evaluation Metrics](#evaluation-metrics)
+- [Project Structure](#project-structure)
+- [Installation & Usage](#installation--usage)
+- [Reproducibility](#reproducibility)
+- [Current Status](#current-status)
+- [Limitations](#limitations)
+- [Future Work](#future-work)
+- [Citation](#citation)
+- [Author](#author)
 
 ---
 
-## 📊 Experiments (E1-E5)
+## Overview
 
-### **E1: Label Scarcity Sweep** (100% → 1% labels)
+**SemiGAN-MelanoPath v2** is a research framework for **histopathology cancer classification under extreme label scarcity** — the setting where only a tiny fraction of available medical images have expert-verified labels.
 
-| Label % | SemiGAN-v2 | Supervised Baseline | Gain |
-|---------|-----------|------------------|------|
-| 100% | 93.2±1.1% | 93.8±0.8% | — |
-| 25% | 89.7±1.4% | 85.2±2.1% | **+4.5%** |
-| 10% | 83.4±2.0% | 74.1±2.8% | **+9.3%** |
-| 1% | 76.8±2.5% | 62.3±3.4% | **+14.5%** |
+The framework combines five learning signals in a single discriminator network:
 
-**Key**: At 1% labels (≈25 slides), SemiGAN-v2 achieves 76.8% vs 62% baseline
+| Component | Role |
+|---|---|
+| Supervised classification | Learns directly from the (small) labeled set |
+| Semi-supervised GAN | Learns from real vs. generated samples, exploiting unlabeled data |
+| Virtual Adversarial Training (VAT) | Consistency regularization — stable predictions under small input perturbations |
+| Rotation self-supervision | Auxiliary label-free task (predict 0°/90°/180°/270°) that shapes useful representations |
+| Feature matching + noise injection | Additional regularization on intermediate representations |
+| MC-Dropout | Estimates predictive uncertainty at inference time, not just a point prediction |
 
----
+## Research Question
 
-### **E2: Domain Shift (BreakHis → MHIST)**
+> **Can semi-supervised adversarial learning, combined with consistency regularization and self-supervised objectives, improve histopathology cancer classification when only a very small fraction of training patients are labeled?**
 
-| Scenario | Accuracy | AUC | F1 |
-|----------|----------|-----|-----|
-| Zero-shot transfer | 58.3% | 0.61 | 0.58 |
-| +1% MHIST fine-tune | 73.1% | 0.79 | 0.72 |
-| **Transfer Gap** | **+14.8%** | **+0.18** | **+0.14** |
+Medical image annotation requires domain experts and is expensive to scale. This project tests whether the *unlabeled* majority of a histopathology dataset can still be put to productive use — rather than discarded — when labels are scarce.
 
-**Clinical**: 1% fine-tuning (2-3 slides) recovers 73% on external cohort
+## Key Highlights
 
----
-
-### **E3: Label Budget Calculator**
-
-Assumption: Pathologist labels 1 slide in ~30 minutes
-
-| Label % | Slides Labeled | Hours | Hours Saved | Accuracy |
-|---------|----------------|-------|------------|----------|
-| 100% | 400 | 200h | — | 93.2% |
-| 25% | 100 | 50h | **150h** | 89.7% |
-| 10% | 40 | 20h | **180h** | 83.4% |
-| 1% | 4 | 2h | **198h** | 76.8% |
-
-**Value**: 1 week labeling → model generalizable across cohorts
+- End-to-end pipeline: data loading → patient-level splitting → label-budget generation → semi-supervised training → uncertainty-aware evaluation → result aggregation
+- Real experimental validation on **BreakHis** (7,909 images / 82 patients), not a toy dataset
+- Strict **patient-level** train/val/test splitting to eliminate leakage — a common failure mode in medical-imaging papers
+- A 5-stage **controlled ablation design** (E1 → E5) isolating the contribution of GAN learning, VAT, rotation SSL, and feature matching
+- Uncertainty quantification via MC-Dropout (entropy, mutual information, probability variance) rather than reporting accuracy alone
+- Transparent reporting: the repo explicitly separates **implemented**, **experimentally validated**, and **planned** work — see [Limitations](#limitations)
 
 ---
 
-### **E4: Ablation Study (10% labels)**
+## Methodology
 
-| Component | Accuracy | Δ vs Full | Impact |
-|-----------|----------|----------|--------|
-| Full SemiGAN-v2 | **83.4±2.0%** | — | Baseline |
-| w/o VAT | 80.1±2.3% | **-3.3%** | **Highest** |
-| w/o Rotation SSL | 79.8±2.4% | **-3.6%** | **Highest** |
-| w/o Feature Match | 82.1±2.2% | -1.3% | Medium |
-| SSL only (w/o GAN) | 78.3±2.8% | **-5.1%** | Critical |
+### Architecture
 
-**Ranking**: VAT ≈ Rotation > GAN > Feature Match
+```mermaid
+flowchart TD
+    A[Histopathology Images] --> B[Labeled Subset]
+    A --> C[Unlabeled Subset]
 
----
+    B --> D[Supervised Classification Loss]
+    C --> E[Virtual Adversarial Training]
+    C --> F[Rotation Self-Supervision]
+    C --> G[GAN Adversarial Learning]
 
-### **E5: Uncertainty & Calibration (MC-Dropout, 20 passes)**
+    D --> H((Shared Discriminator))
+    E --> H
+    F --> H
+    G --> H
 
-| Metric | Value | Interpretation |
-|--------|-------|-----------------|
-| ECE | 0.087 | Well-calibrated predictions |
-| Abstention @ 95% acc | 71% coverage | Model reliable on 71% predictions |
-| Max Uncertainty | 0.34 logits | Sufficient variance |
+    H --> I[Class Head]
+    H --> J[Rotation Head]
+    H --> K[Real / Fake Head]
+    H --> L[Feature Representation]
 
-**Clinical Use**: Flag predictions with uncertainty > 0.20 for pathologist review
-
----
-
-## 🚀 Quick Start
-
-### Installation
-```bash
-cd semigan-melanopathy
-pip install -r requirements.txt
+    I --> M[Final Prediction]
+    K --> M
+    M --> N[Evaluation + MC-Dropout Uncertainty]
 ```
 
-### Train (100% labels)
-```bash
-python train.py --config configs/default.yaml --exp my_exp --label_pct 100 --seed 42
+### Dual-Head Discriminator
+
+```mermaid
+flowchart LR
+    IMG[Input Image] --> FE[Feature Extractor]
+    FE --> C1[Class Prediction]
+    FE --> C2[Rotation Prediction]
+    FE --> C3[Real / Fake Prediction]
+    FE --> C4[Feature Representation<br/>for feature matching]
 ```
 
-### Run All Experiments (E1-E5)
-```bash
-python run_experiments.py --exp all --results_dir ./runs
-```
+**Virtual Adversarial Training** encourages stable predictions under a worst-case small perturbation:
 
-### Evaluate Checkpoint
-```bash
-python eval/evaluate_checkpoint.py \
-    --ckpt runs/semigan_v2_lbl100_s42/checkpoints/ckpt_epoch_50.pt \
-    --test_data ./data/BreakHis \
-    --mc_passes 20
+$$\mathcal{L}_{VAT} = D_{KL}\big(p(y \mid x) \,\|\, p(y \mid x + r_{adv})\big)$$
+
+**Supervised loss** on the labeled subset is standard cross-entropy:
+
+$$\mathcal{L}_{sup} = CE(y, \hat{y})$$
+
+**Monte Carlo Dropout** replaces a single forward pass with $N$ stochastic passes at inference, from which predictive entropy, expected entropy, mutual information, and probability variance are computed — giving an uncertainty estimate alongside every prediction rather than a bare class label.
+
+---
+
+## Dataset & Patient-Level Splitting
+
+**BreakHis** (Breast Cancer Histopathological Image Classification):
+
+| Property | Value |
+|---|---:|
+| Total images | 7,909 |
+| Total patients | 82 |
+| Benign images | 2,480 |
+| Malignant images | 5,429 |
+
+Splitting is done **at the patient level**, not the image level, so that no patient's images appear in more than one partition:
+
+<img src="assets/patient_split.png" width="620" alt="Patient-level split: 56 train / 13 val / 13 test patients, 5,498 / 1,271 / 1,140 images">
+
+| Split | Patients | Images |
+|---|---:|---:|
+| Train | 56 | 5,498 |
+| Validation | 13 | 1,271 |
+| Test | 13 | 1,140 |
+| **Total** | **82** | **7,909** |
+
+This matters because histopathology images from the same patient are visually correlated — image-level random splitting would let the model implicitly "see" the test patient during training, inflating reported performance.
+
+---
+
+## Extreme Label Scarcity
+
+The framework supports controlled labeled-data budgets: **1%, 5%, 10%, 20%, 100%**.
+
+Because selection happens at the **patient** level (whole patients are labeled or not), the *requested* percentage and the *actual* labeled percentage of images differ. The pipeline logs both, so every run is transparent about what was actually labeled:
+
+```text
+Requested label budget:     1%
+Training patients:          56
+Labeled patients:            2   (3.57% of training patients)
+Unlabeled patients:         54
+Training images:          5498
+Labeled images:             297  (5.40% of training images)
+Unlabeled images:         5201
 ```
 
 ---
 
-## 📂 Repository Structure
+## Experimental Framework (E1–E5)
 
+A controlled, incremental ablation isolates the contribution of each component:
+
+```mermaid
+flowchart LR
+    E1[E1 — Supervised Baseline] --> E2[E2 — + GAN]
+    E2 --> E3[E3 — + VAT]
+    E3 --> E4[E4 — + Rotation SSL]
+    E4 --> E5[E5 — + Feature Matching + Noise Injection]
 ```
-semigan-melanopathy/
-├── configs/
-│   └── default.yaml
-├── data/
-│   └── loaders.py                 # BreakHis/MHIST loaders
-├── models/
-│   ├── architectures.py           # Generator, Discriminator, dual heads
-│   └── losses.py                  # VAT, CE, feature match
-├── eval/
-│   ├── evaluator.py               # E1-E5 experiment orchestration
-│   └── evaluate_checkpoint.py
+
+| Experiment | GAN | VAT | Rotation SSL | Feature Matching | Noise Injection | Purpose |
+|---|:---:|:---:|:---:|:---:|:---:|---|
+| **E1** | ✗ | ✗ | ✗ | ✗ | ✗ | Supervised baseline under limited labels |
+| **E2** | ✓ | ✗ | ✗ | ✗ | ✗ | Contribution of semi-supervised adversarial learning |
+| **E3** | ✓ | ✓ | ✗ | ✗ | ✗ | Contribution of consistency regularization |
+| **E4** | ✓ | ✓ | ✓ | ✗ | ✗ | Contribution of self-supervised representation learning |
+| **E5** | ✓ | ✓ | ✓ | ✓ | ✓ | Full model |
+
+Full planned matrix: **5 experiments × 5 label budgets × N seeds**. With one seed (42), this defines **25 experimental conditions** — the framework is built to run all of them, but *only one has been executed so far* (see below).
+
+---
+
+## Results
+
+### Completed run: E5 (Full Model), 1% label budget, seed 42
+
+<img src="assets/results_metrics.png" width="620" alt="E5 1% BreakHis test metrics: Accuracy 0.5781, Precision 0.6898, Recall 0.7576, F1 0.7221, ROC-AUC 0.4922">
+
+| Metric | Test Result |
+|---|---:|
+| Accuracy | 0.5781 |
+| Precision | 0.6898 |
+| Recall | 0.7576 |
+| F1 | 0.7221 |
+| ROC-AUC | 0.4922 |
+
+**Reading these honestly:** this is a single run at the hardest label budget (1%), with one seed. The ROC-AUC near 0.5 indicates the model's ranking of positive vs. negative cases is close to random at this extreme label budget — which is itself a useful (if modest) finding, and precisely why the multi-seed, multi-budget comparison in [Future Work](#future-work) is necessary before drawing conclusions about the method's effectiveness. This run should be read as **evidence the pipeline works end-to-end**, not as a performance claim.
+
+---
+
+## Evaluation Metrics
+
+Standard classification metrics (Accuracy, Precision, Recall, F1, ROC-AUC) plus:
+
+- **Expected Calibration Error (ECE)** — gap between model confidence and empirical accuracy
+- **Uncertainty metrics** via MC-Dropout — predictive entropy, expected entropy, mutual information, probability variance, coverage-based evaluation
+
+---
+
+## Project Structure
+
+```text
+SemiGAN-MelanoPath/
+├── configs/            # YAML experiment configuration
+├── data/                # Dataset loaders (BreakHis, MHIST)
+├── models/              # Architectures + loss functions
+├── training/             # Training loop
+├── eval/                 # Evaluator, checkpoint evaluation, metrics
+├── experiments/           # Experiment matrix definitions + runner
+├── scripts/               # Result aggregation
+├── results/                # aggregated_results.csv
+├── runs/                    # Per-run checkpoints, logs, outputs
+├── tests/
 ├── notebooks/
-│   └── analysis.ipynb
-├── runs/
-│   ├── E1_label_scarcity_*.csv
-│   ├── E2_domain_shift_*.json
-│   ├── E4_ablations_*.csv
-│   └── SUMMARY_*.txt
+├── docs/
+│   └── research_problem.md
 ├── train.py
-├── run_experiments.py
 ├── requirements.txt
 └── README.md
 ```
 
 ---
 
-## 🔬 Data Handling (No Label Leakage)
+## Installation & Usage
 
-### BreakHis
-- **Patient-level split**: `GroupShuffleSplit` on patient IDs
-- **Stratification**: By class within groups
-- **Guarantee**: No patient's images split across train/test
+### Setup
 
-### MHIST
-- **External validation**: Held-out, E2 domain shift only
-- **No tuning**: No hyperparameter optimization on MHIST
+```bash
+git clone https://github.com/iqrasafdarr/SemiGAN-MelanoPath.git
+cd SemiGAN-MelanoPath
 
-### Label Scarcity
-- 10% labels: all images from 10 patients (stratified)
-- 1% labels: all images from 1 patient
-- **No leakage**: Every patient entirely labeled or unlabeled
+python3.11 -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\Activate.ps1
 
----
+pip install -r requirements.txt
+```
 
-## ✅ Reproducibility
+Set your local BreakHis path in `configs/default.yaml`:
 
-- ✅ Seed fixing (torch, numpy, CUDA)
-- ✅ Patient-level splitting
-- ✅ 3 random seeds per experiment (mean±std)
-- ✅ Stratification at all label levels
-- ✅ External validation (MHIST zero-shot first)
-- ✅ Dummy data fallback for testing
-- ✅ Checkpoints every 10 epochs
-- ✅ All hyperparameters fixed a priori
+```yaml
+data:
+  breakhis_root: /path/to/BreaKHis_v1/histology_slides/breast
+  mhist_root: ./data/MHIST
+```
 
----
+### Train
 
-## 📚 Key References
+```bash
+python train.py \
+    --config configs/default.yaml \
+    --exp E5_full \
+    --label-pct 1 \
+    --seed 42
+```
 
-1. Miyato et al. (2018): Virtual Adversarial Training
-2. Salimans et al. (2016): Improved Techniques for Training GANs
-3. Gal & Ghahramani (2016): Uncertainty in Deep Learning (MC-Dropout)
-4. Spectral Normalization: Miyato et al.
+### Run the experiment matrix
 
----
+```bash
+python experiments/run_experiment.py --validate       # sanity-check config
+python experiments/run_experiment.py --dry-run          # simulate without training
+python experiments/run_experiment.py --run --experiment E5_full --label-pct 1 --seed 42
+```
 
-## 🎓 Citation
+### Aggregate results
 
-```bibtex
-@inproceedings{semigan_melanopathy_v2,
-  title={SemiGAN-MelanoPath v2: VAT + SSL for Label-Scarce Histopathology},
-  author={Your Name},
-  booktitle={MITACS 54710},
-  year={2024}
-}
+```bash
+python scripts/aggregate_results.py     # → results/aggregated_results.csv
+```
+
+### Evaluate a checkpoint
+
+```bash
+python eval/evaluate_checkpoint.py \
+    --ckpt runs/E5_full_lbl1_s42/checkpoints/best.pt \
+    --dataset breakhis \
+    --device cpu \
+    --config configs/default.yaml
 ```
 
 ---
 
-**Status**: Production-Ready ✓ | **Last Updated**: 2024
+## Reproducibility
+
+Every run is identified by a canonical name `<experiment>_lbl<label_pct>_s<seed>` (e.g. `E5_full_lbl1_s42`) and produces:
+
+- Fixed-seed training with a versioned YAML config
+- Explicit requested vs. actual label percentages (patient- and image-level)
+- Saved checkpoints, training logs, and JSON result files
+- A single aggregated CSV across all completed runs
+
+---
+
+## Current Status
+
+```text
+Implementation                                      COMPLETE
+  Patient-level splitting, label budgets, E1–E5,
+  VAT, rotation SSL, feature matching, noise
+  injection, MC-Dropout, evaluation, experiment
+  runner, result aggregation
+
+Experimentally validated
+  E5, 1% label budget, BreakHis, seed 42            ✅ DONE
+
+Not yet completed
+  Full 25-condition matrix (5 exp × 5 budgets)      ⬜
+  Multi-seed variance study                          ⬜
+  External MHIST validation (real data)              ⬜
+```
+
+---
+
+## Limitations
+
+1. **Only one of 25 planned conditions has been run.** E1–E4 and higher label budgets are implemented but not yet executed.
+2. **Single seed (42).** No variance estimate yet across seeds.
+3. **MHIST loader exists but is untested on real data** — external cross-domain validation is pending.
+4. **Compute-bound.** Running the full matrix with multiple seeds is the main bottleneck to completing the study.
+5. **Current results are not evidence of superiority** over simpler baselines — they demonstrate the pipeline runs correctly end-to-end at the hardest label budget.
+
+## Future Work
+
+- Run the full E1–E5 × label-budget matrix
+- Multi-seed evaluation for variance estimates
+- Real MHIST external validation
+- Statistical significance testing between ablation stages
+- Calibration analysis across label budgets
+- Uncertainty-vs-correctness and abstention curves
+- Cross-domain generalization study
+- Hyperparameter sensitivity analysis
+- Formal write-up as a research manuscript
+
+---
+
+## Citation
+
+```bibtex
+@software{semiGAN_melanopath_v2,
+  author = {Safdar, Iqra},
+  title  = {SemiGAN-MelanoPath v2: Semi-Supervised GAN with Consistency
+            Regularization and Self-Supervision for Histopathology Cancer
+            Detection Under Extreme Label Scarcity},
+  year   = {2026},
+  url    = {https://github.com/iqrasafdarr/SemiGAN-MelanoPath}
+}
+```
+
+## Author
+
+**Iqra Safdar**
+BS Computer Science, COMSATS University Islamabad, Sahiwal Campus
+GitHub: [github.com/iqrasafdarr](https://github.com/iqrasafdarr) · Repo: [SemiGAN-MelanoPath](https://github.com/iqrasafdarr/SemiGAN-MelanoPath)
