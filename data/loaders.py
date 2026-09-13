@@ -327,3 +327,158 @@ def create_loaders(dataset, labeled_indices, unlabeled_indices, batch_size=32):
     )
     
     return labeled_loader, unlabeled_loader
+def get_patient_train_val_test_split(
+    dataset,
+    train_ratio=0.70,
+    val_ratio=0.15,
+    test_ratio=0.15,
+    seed=42,
+):
+    """
+    Create deterministic patient-level train/validation/test splits.
+
+    No patient can occur in more than one split.
+
+    The split is performed at patient level first, then image indices
+    are assigned to the corresponding patient split.
+    """
+    if not np.isclose(
+        train_ratio + val_ratio + test_ratio,
+        1.0
+    ):
+        raise ValueError(
+            "train_ratio + val_ratio + test_ratio must equal 1."
+        )
+
+    if min(
+        train_ratio,
+        val_ratio,
+        test_ratio
+    ) <= 0:
+        raise ValueError(
+            "All split ratios must be greater than zero."
+        )
+
+    samples = dataset.samples
+
+    if not samples:
+        raise ValueError("Dataset contains no samples.")
+
+    patient_to_indices = {}
+
+    for idx, sample in enumerate(samples):
+        patient_id = sample["patient_id"]
+        patient_to_indices.setdefault(
+            patient_id,
+            []
+        ).append(idx)
+
+    patients = np.array(
+        list(patient_to_indices.keys())
+    )
+
+    # Determine one class label per patient.
+    patient_labels = np.array([
+        samples[patient_to_indices[p][0]]["label"]
+        for p in patients
+    ])
+
+    rng = np.random.RandomState(seed)
+
+    train_patients = []
+    val_patients = []
+    test_patients = []
+
+    # Stratify by patient class so both classes are represented
+    # whenever the number of patients allows it.
+    for cls in np.unique(patient_labels):
+        cls_patients = patients[
+            patient_labels == cls
+        ].copy()
+
+        rng.shuffle(cls_patients)
+
+        n = len(cls_patients)
+
+        n_test = max(
+            1,
+            int(round(n * test_ratio))
+        )
+
+        n_val = max(
+            1,
+            int(round(n * val_ratio))
+        )
+
+        # Ensure at least one patient remains for training.
+        if n_test + n_val >= n:
+            n_test = 1
+            n_val = 1
+
+        test_cls = cls_patients[:n_test]
+        val_cls = cls_patients[
+            n_test:n_test + n_val
+        ]
+        train_cls = cls_patients[
+            n_test + n_val:
+        ]
+
+        train_patients.extend(train_cls.tolist())
+        val_patients.extend(val_cls.tolist())
+        test_patients.extend(test_cls.tolist())
+
+    # Shuffle patient ordering inside each split.
+    rng.shuffle(train_patients)
+    rng.shuffle(val_patients)
+    rng.shuffle(test_patients)
+
+    train_patients = np.array(train_patients)
+    val_patients = np.array(val_patients)
+    test_patients = np.array(test_patients)
+
+    train_indices = np.array([
+        idx
+        for patient in train_patients
+        for idx in patient_to_indices[patient]
+    ], dtype=int)
+
+    val_indices = np.array([
+        idx
+        for patient in val_patients
+        for idx in patient_to_indices[patient]
+    ], dtype=int)
+
+    test_indices = np.array([
+        idx
+        for patient in test_patients
+        for idx in patient_to_indices[patient]
+    ], dtype=int)
+
+    # Hard safety check: no patient leakage.
+    train_set = set(train_patients)
+    val_set = set(val_patients)
+    test_set = set(test_patients)
+
+    if train_set & val_set:
+        raise RuntimeError(
+            "Patient leakage detected: train/validation overlap."
+        )
+
+    if train_set & test_set:
+        raise RuntimeError(
+            "Patient leakage detected: train/test overlap."
+        )
+
+    if val_set & test_set:
+        raise RuntimeError(
+            "Patient leakage detected: validation/test overlap."
+        )
+
+    return {
+        "train_indices": train_indices,
+        "val_indices": val_indices,
+        "test_indices": test_indices,
+        "train_patients": train_patients,
+        "val_patients": val_patients,
+        "test_patients": test_patients,
+    }
