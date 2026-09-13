@@ -1,195 +1,279 @@
-#!/usr/bin/env python3
-"""
-Aggregate results from multiple experiments and seeds.
-Computes mean±std for E1-E5 across 3 seeds.
-"""
-
-import os
+﻿import argparse
+import csv
 import json
-import glob
-import pandas as pd
-import numpy as np
+import re
 from pathlib import Path
-from collections import defaultdict
-import sys
+
+import numpy as np
 
 
-def aggregate_e1_label_scarcity(results_dir='runs'):
-    """Aggregate E1 label scarcity results across seeds."""
-    print("\n" + "="*70)
-    print("E1: Label Scarcity Sweep (100% → 1%)")
-    print("="*70)
-    
-    # Find all E1 result files
-    e1_files = glob.glob(os.path.join(results_dir, 'E1_label_scarcity_*.csv'))
-    
-    if not e1_files:
-        print("No E1 results found.")
-        return None
-    
-    # Combine
-    dfs = [pd.read_csv(f) for f in e1_files]
-    df_combined = pd.concat(dfs, ignore_index=True)
-    
-    # Aggregate by label percentage
-    summary = df_combined.groupby('label_pct').agg({
-        'accuracy': ['mean', 'std', 'count']
-    }).round(4)
-    
-    print(summary)
-    return summary
+EXPERIMENTS = [
+    "E1_supervised",
+    "E2_semigan",
+    "E3_semigan_vat",
+    "E4_semigan_vat_rotation",
+    "E5_full",
+]
+
+RUN_PATTERN = re.compile(
+    r"^(E[1-5]_[a-z_]+)_lbl(\d+)_s(\d+)$"
+)
 
 
-def aggregate_e2_domain_shift(results_dir='runs'):
-    """Aggregate E2 domain shift results."""
-    print("\n" + "="*70)
-    print("E2: Domain Shift (BreakHis → MHIST)")
-    print("="*70)
-    
-    e2_files = glob.glob(os.path.join(results_dir, 'E2_domain_shift_*.json'))
-    
-    if not e2_files:
-        print("No E2 results found.")
-        return None
-    
-    results = defaultdict(list)
-    
-    for f in e2_files:
-        with open(f) as fp:
-            data = json.load(fp)
-            for key in data.keys():
-                if key in ['setting', 'accuracy', 'auc', 'f1']:
-                    continue
-                if isinstance(data[key], (list, dict)):
-                    for i, val in enumerate(data[key]):
-                        if isinstance(val, (int, float)):
-                            results[f"{key}_{i}"].append(val)
-    
-    print("Zero-shot accuracy:", np.mean(results.get('accuracy_0', [0])))
-    print("Fine-tuned accuracy (+1%):", np.mean(results.get('accuracy_1', [0])))
-    print("Transfer gap:", 
-          np.mean(results.get('accuracy_1', [0])) - np.mean(results.get('accuracy_0', [0])))
-    
-    return results
+def load_results(results_dir):
+    """Load canonical results.json files from all experiment run directories."""
+    results_dir = Path(results_dir)
+    records = []
+
+    for run_dir in sorted(results_dir.iterdir()):
+        if not run_dir.is_dir():
+            continue
+
+        match = RUN_PATTERN.match(run_dir.name)
+        if not match:
+            continue
+
+        experiment, label_pct, seed = match.groups()
+        results_file = run_dir / "results.json"
+
+        if not results_file.exists():
+            continue
+
+        try:
+            with open(results_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as exc:
+            print(f"WARNING: Could not read {results_file}: {exc}")
+            continue
+
+        metrics = data.get("test_metrics", {})
+
+        record = {
+            "run": run_dir.name,
+            "experiment": experiment,
+            "label_pct_requested": int(label_pct),
+            "seed": int(seed),
+            "accuracy": metrics.get("accuracy"),
+            "precision": metrics.get("precision"),
+            "recall": metrics.get("recall"),
+            "f1": metrics.get("f1"),
+            "roc_auc": metrics.get("roc_auc"),
+            "actual_patient_pct": data.get("actual_patient_pct"),
+            "actual_image_pct": data.get("actual_image_pct"),
+            "n_labeled_patients": data.get("n_labeled_patients"),
+            "n_labeled_images": data.get("n_labeled_images"),
+            "best_epoch": data.get("best_epoch"),
+        }
+
+        records.append(record)
+
+    return records
 
 
-def aggregate_e3_label_budget(results_dir='runs'):
-    """Aggregate E3 label budget results."""
-    print("\n" + "="*70)
-    print("E3: Label Budget Calculator")
-    print("="*70)
-    
-    e3_files = glob.glob(os.path.join(results_dir, 'E3_label_budget_*.csv'))
-    
-    if not e3_files:
-        print("No E3 results found.")
-        return None
-    
-    dfs = [pd.read_csv(f) for f in e3_files]
-    df_combined = pd.concat(dfs, ignore_index=True)
-    
-    # Show unique label percentages and hours saved
-    summary = df_combined[['label_pct', 'hours_saved', 'accuracy']].drop_duplicates()
-    summary = summary.sort_values('label_pct')
-    
-    print(summary.to_string(index=False))
-    return summary
+def print_runs(records):
+    print("\n" + "=" * 100)
+    print("CANONICAL EXPERIMENT RESULTS")
+    print("=" * 100)
+
+    if not records:
+        print("No canonical results.json files found.")
+        return
+
+    for r in records:
+        print(
+            f"{r['run']:<42} "
+            f"Acc={format_metric(r['accuracy'])} "
+            f"F1={format_metric(r['f1'])} "
+            f"AUC={format_metric(r['roc_auc'])}"
+        )
 
 
-def aggregate_e4_ablations(results_dir='runs'):
-    """Aggregate E4 ablation results."""
-    print("\n" + "="*70)
-    print("E4: Ablation Study (10% labels)")
-    print("="*70)
-    
-    e4_files = glob.glob(os.path.join(results_dir, 'E4_ablations_*.csv'))
-    
-    if not e4_files:
-        print("No E4 results found.")
-        return None
-    
-    dfs = [pd.read_csv(f) for f in e4_files]
-    df_combined = pd.concat(dfs, ignore_index=True)
-    
-    # Aggregate by model variant
-    summary = df_combined.groupby('model').agg({
-        'accuracy': ['mean', 'std'],
-        'std': 'mean'
-    }).round(4)
-    
-    print(summary)
-    return summary
+def format_metric(value):
+    if value is None:
+        return "N/A"
+    return f"{float(value):.4f}"
 
 
-def aggregate_e5_uncertainty(results_dir='runs'):
-    """Aggregate E5 uncertainty results."""
-    print("\n" + "="*70)
-    print("E5: Uncertainty & Calibration (MC-Dropout)")
-    print("="*70)
-    
-    e5_files = glob.glob(os.path.join(results_dir, 'E5_uncertainty_*.json'))
-    
-    if not e5_files:
-        print("No E5 results found.")
-        return None
-    
-    ece_list = []
-    uncertainty_list = []
-    coverage_95_list = []
-    
-    for f in e5_files:
-        with open(f) as fp:
-            data = json.load(fp)
-            if 'ece' in data:
-                ece_list.append(float(data['ece']))
-            if 'mean_uncertainty' in data:
-                uncertainty_list.append(float(data['mean_uncertainty']))
-    
-    if ece_list:
-        print(f"ECE (mean±std): {np.mean(ece_list):.4f}±{np.std(ece_list):.4f}")
-    if uncertainty_list:
-        print(f"Mean Uncertainty: {np.mean(uncertainty_list):.4f}±{np.std(uncertainty_list):.4f}")
-    
-    return {
-        'ece': ece_list,
-        'uncertainty': uncertainty_list
-    }
+def aggregate_by_experiment(records):
+    """Aggregate metrics by experiment."""
+    print("\n" + "=" * 100)
+    print("AGGREGATION BY EXPERIMENT")
+    print("=" * 100)
+
+    for experiment in EXPERIMENTS:
+        rows = [r for r in records if r["experiment"] == experiment]
+
+        if not rows:
+            continue
+
+        print(f"\n{experiment} ({len(rows)} runs)")
+
+        for metric in ["accuracy", "precision", "recall", "f1", "roc_auc"]:
+            values = [
+                float(r[metric])
+                for r in rows
+                if r[metric] is not None
+            ]
+
+            if values:
+                mean = np.mean(values)
+                std = np.std(values)
+
+                print(
+                    f"  {metric:<10}: "
+                    f"{mean:.4f} +/- {std:.4f}"
+                )
+
+
+def aggregate_by_label_budget(records):
+    """Aggregate metrics by requested label budget."""
+    print("\n" + "=" * 100)
+    print("AGGREGATION BY LABEL BUDGET")
+    print("=" * 100)
+
+    budgets = sorted(
+        set(r["label_pct_requested"] for r in records)
+    )
+
+    for budget in budgets:
+        rows = [
+            r for r in records
+            if r["label_pct_requested"] == budget
+        ]
+
+        print(f"\nRequested labels: {budget}%")
+
+        for experiment in EXPERIMENTS:
+            exp_rows = [
+                r for r in rows
+                if r["experiment"] == experiment
+            ]
+
+            if not exp_rows:
+                continue
+
+            f1_values = [
+                float(r["f1"])
+                for r in exp_rows
+                if r["f1"] is not None
+            ]
+
+            auc_values = [
+                float(r["roc_auc"])
+                for r in exp_rows
+                if r["roc_auc"] is not None
+            ]
+
+            f1 = (
+                f"{np.mean(f1_values):.4f}"
+                if f1_values else "N/A"
+            )
+            auc = (
+                f"{np.mean(auc_values):.4f}"
+                if auc_values else "N/A"
+            )
+
+            print(
+                f"  {experiment:<30} "
+                f"F1={f1}  ROC-AUC={auc}"
+            )
+
+
+def save_csv(records, output_path):
+    """Save canonical results as CSV."""
+    if not records:
+        return
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    fields = [
+        "run",
+        "experiment",
+        "label_pct_requested",
+        "seed",
+        "actual_patient_pct",
+        "actual_image_pct",
+        "n_labeled_patients",
+        "n_labeled_images",
+        "best_epoch",
+        "accuracy",
+        "precision",
+        "recall",
+        "f1",
+        "roc_auc",
+    ]
+
+    with open(
+        output_path,
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(records)
+
+    print(f"\nSaved CSV: {output_path}")
 
 
 def main():
-    import argparse
     parser = argparse.ArgumentParser(
-        description='Aggregate SemiGAN-MelanoPath results'
+        description="Aggregate SemiGAN-MelanoPath canonical experiment results"
     )
-    parser.add_argument('--results_dir', default='runs',
-                       help='Directory containing results')
-    parser.add_argument('--exp', choices=['all', 'e1', 'e2', 'e3', 'e4', 'e5'],
-                       default='all', help='Which experiment to aggregate')
+
+    parser.add_argument(
+        "--results-dir",
+        default="runs",
+        help="Directory containing canonical experiment runs",
+    )
+
+    parser.add_argument(
+        "--output",
+        default="results/aggregated_results.csv",
+        help="Output CSV path",
+    )
+
+    parser.add_argument(
+        "--exp",
+        choices=["all", "e1", "e2", "e3", "e4", "e5"],
+        default="all",
+        help="Experiment filter",
+    )
+
     args = parser.parse_args()
-    
-    print("\n" + "="*70)
+
+    records = load_results(args.results_dir)
+
+    mapping = {
+        "e1": "E1_supervised",
+        "e2": "E2_semigan",
+        "e3": "E3_semigan_vat",
+        "e4": "E4_semigan_vat_rotation",
+        "e5": "E5_full",
+    }
+
+    if args.exp != "all":
+        records = [
+            r for r in records
+            if r["experiment"] == mapping[args.exp]
+        ]
+
+    print("\n" + "=" * 100)
     print("SemiGAN-MelanoPath v2: Results Aggregation")
-    print("="*70)
-    
-    if args.exp in ['all', 'e1']:
-        aggregate_e1_label_scarcity(args.results_dir)
-    
-    if args.exp in ['all', 'e2']:
-        aggregate_e2_domain_shift(args.results_dir)
-    
-    if args.exp in ['all', 'e3']:
-        aggregate_e3_label_budget(args.results_dir)
-    
-    if args.exp in ['all', 'e4']:
-        aggregate_e4_ablations(args.results_dir)
-    
-    if args.exp in ['all', 'e5']:
-        aggregate_e5_uncertainty(args.results_dir)
-    
-    print("\n" + "="*70)
-    print("Aggregation complete!")
-    print("="*70 + "\n")
+    print("=" * 100)
+
+    print(f"\nCanonical runs discovered: {len(records)}")
+
+    print_runs(records)
+    aggregate_by_experiment(records)
+    aggregate_by_label_budget(records)
+    save_csv(records, args.output)
+
+    print("\n" + "=" * 100)
+    print("Aggregation complete")
+    print("=" * 100)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
