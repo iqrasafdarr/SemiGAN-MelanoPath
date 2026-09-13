@@ -1,0 +1,60 @@
+﻿# SemiGAN-MelanoPath Experiment Matrix
+
+experiments:
+
+  E1_supervised:
+    description: "Supervised baseline using labeled training data only"
+    use_gan: false
+    use_vat: false
+    use_rotation_ssl: false
+    use_feature_matching: false
+    use_noise_injection: false
+
+  E2_semigan:
+    description: "Semi-supervised GAN baseline"
+    use_gan: true
+    use_vat: false
+    use_rotation_ssl: false
+    use_feature_matching: false
+    use_noise_injection: false
+
+  E3_semigan_vat:
+    description: "SemiGAN with Virtual Adversarial Training"
+    use_gan: true
+    use_vat: true
+    use_rotation_ssl: false
+    use_feature_matching: false
+    use_noise_injection: false
+
+  E4_semigan_vat_rotation:
+    description: "SemiGAN with VAT and rotation self-supervision"
+    use_gan: true
+    use_vat: true
+    use_rotation_ssl: true
+    use_feature_matching: false
+    use_noise_injection: false
+
+  E5_full:
+    description: "Full SemiGAN-MelanoPath model"
+    use_gan: true
+    use_vat: true
+    use_rotation_ssl: true
+    use_feature_matching: true
+    use_noise_injection: true
+
+label_budgets:
+  - 1
+  - 5
+  - 10
+  - 20
+  - 100
+
+seeds:
+  - 42
+
+dataset:
+  name: BreakHis
+  split_strategy: patient_level
+  train_ratio: 0.70
+  validation_ratio: 0.15
+  test_ratio: 0.15
