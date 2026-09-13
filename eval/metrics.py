@@ -69,7 +69,12 @@ def classification_metrics(y_true, y_pred, y_prob=None):
         # ROC-AUC requires both classes to be present.
         if len(np.unique(y_true)) == 2:
             results["roc_auc"] = float(
-                roc_auc_score(y_true, y_prob)
+                roc_auc_score(
+                y_true,
+                np.asarray(y_prob)[:, 1]
+                if np.asarray(y_prob).ndim == 2
+                else y_prob
+            )
             )
 
     return results
