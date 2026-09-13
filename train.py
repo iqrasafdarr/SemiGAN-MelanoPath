@@ -1,4 +1,4 @@
-﻿import argparse
+import argparse
 import json
 import logging
 from pathlib import Path
@@ -34,10 +34,18 @@ logger = logging.getLogger(__name__)
 class SemiGANTrainer:
     """SemiGAN-MelanoPath v2 trainer with patient-level evaluation."""
 
-    def __init__(self, config_path, exp_name, label_pct, seed):
+    def __init__(
+        self,
+        config_path,
+        exp_name,
+        label_pct,
+        seed,
+        experiment="E5_full",
+    ):
         self.seed = seed
         self.label_pct = label_pct
         self.exp_name = exp_name
+        self.experiment = experiment
 
         self.device = torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
@@ -47,6 +55,61 @@ class SemiGANTrainer:
 
         with open(config_path, "r") as f:
             self.config = yaml.safe_load(f)
+
+        experiment_config_path = Path(
+            "experiments/experiment_configs.yaml"
+        )
+
+        if not experiment_config_path.exists():
+            raise FileNotFoundError(
+                "Missing experiments/experiment_configs.yaml"
+            )
+
+        with experiment_config_path.open(
+            "r",
+            encoding="utf-8",
+        ) as f:
+            experiment_matrix = yaml.safe_load(f)
+
+        if self.experiment not in experiment_matrix["experiments"]:
+            raise ValueError(
+                f"Unknown experiment: {self.experiment}. "
+                f"Available: "
+                f"{list(experiment_matrix['experiments'].keys())}"
+            )
+
+        self.experiment_config = experiment_matrix[
+            "experiments"
+        ][self.experiment]
+
+        self.features = {
+            "use_gan": bool(
+                self.experiment_config["use_gan"]
+            ),
+            "use_vat": bool(
+                self.experiment_config["use_vat"]
+            ),
+            "use_rotation_ssl": bool(
+                self.experiment_config["use_rotation_ssl"]
+            ),
+            "use_feature_matching": bool(
+                self.experiment_config["use_feature_matching"]
+            ),
+            "use_noise_injection": bool(
+                self.experiment_config["use_noise_injection"]
+            ),
+        }
+
+        logger.info(
+            "Experiment: %s | %s",
+            self.experiment,
+            self.experiment_config["description"],
+        )
+
+        logger.info(
+            "Feature switches: %s",
+            self.features,
+        )
 
         self._set_seed()
         self._setup_paths()
@@ -136,8 +199,11 @@ class SemiGANTrainer:
         """
         Train using patient-level train/validation/test separation.
 
-        Only the training patients participate in the labeled/unlabeled
-        split. Validation and test patients are completely isolated.
+        The labeled/unlabeled split is performed only inside the
+        training patients. Validation and test patients remain
+        completely isolated.
+
+        E1-E5 feature switches control the actual training objective.
         """
 
         split = get_patient_train_val_test_split(
@@ -174,11 +240,6 @@ class SemiGANTrainer:
             len(test_indices),
         )
 
-        # ------------------------------------------------------------------
-        # CRITICAL:
-        # The labeled/unlabeled split happens ONLY inside TRAIN.
-        # ------------------------------------------------------------------
-
         train_split_dataset = BreakHisDataset(
             root_dir=dataset.root_dir,
             transform=dataset.transform,
@@ -190,11 +251,28 @@ class SemiGANTrainer:
         )
 
         logger.info(
-            "Label budget: %s%% | Labeled images: %d | "
-            "Unlabeled images: %d",
+            "Requested label budget: %.2f%%",
             self.label_pct,
+        )
+
+        logger.info(
+            "Actual labeled patients: %d / %d (%.2f%%)",
+            split_info["n_labeled_patients"],
+            split_info["n_train_patients"],
+            split_info["actual_patient_pct"],
+        )
+
+        logger.info(
+            "Actual labeled images: %d / %d (%.2f%%)",
             split_info["n_labeled"],
+            split_info["n_train_images"],
+            split_info["actual_image_pct"],
+        )
+
+        logger.info(
+            "Unlabeled images: %d / %d",
             split_info["n_unlabeled"],
+            split_info["n_train_images"],
         )
 
         labeled_loader, unlabeled_loader = create_loaders(
@@ -218,25 +296,28 @@ class SemiGANTrainer:
             "val_roc_auc": [],
         }
 
-        # ------------------------------------------------------------------
-        # TRAIN
-        # ------------------------------------------------------------------
-
         for epoch in range(num_epochs):
             epoch_loss_D = 0.0
             epoch_loss_G = 0.0
             n_batches = 0
 
             self.D.train()
-            self.G.train()
+
+            if self.features["use_gan"]:
+                self.G.train()
 
             labeled_iter = iter(labeled_loader)
-            unlabeled_iter = iter(unlabeled_loader)
 
-            max_batches = max(
-                len(labeled_loader),
-                len(unlabeled_loader),
-            )
+            if (
+                self.features["use_gan"]
+                or self.features["use_vat"]
+                or self.features["use_rotation_ssl"]
+            ):
+                unlabeled_iter = iter(unlabeled_loader)
+            else:
+                unlabeled_iter = None
+
+            max_batches = len(labeled_loader)
 
             pbar = tqdm(
                 range(max_batches),
@@ -244,18 +325,24 @@ class SemiGANTrainer:
             )
 
             for _ in pbar:
-
                 try:
                     labeled_batch = next(labeled_iter)
                 except StopIteration:
                     labeled_iter = iter(labeled_loader)
                     labeled_batch = next(labeled_iter)
 
-                try:
-                    unlabeled_batch = next(unlabeled_iter)
-                except StopIteration:
-                    unlabeled_iter = iter(unlabeled_loader)
-                    unlabeled_batch = next(unlabeled_iter)
+                unlabeled_batch = None
+
+                if unlabeled_iter is not None:
+                    try:
+                        unlabeled_batch = next(unlabeled_iter)
+                    except StopIteration:
+                        unlabeled_iter = iter(unlabeled_loader)
+
+                        if len(unlabeled_loader) > 0:
+                            unlabeled_batch = next(
+                                unlabeled_iter
+                            )
 
                 for _ in range(n_critic):
                     loss_D = self._train_discriminator(
@@ -264,8 +351,14 @@ class SemiGANTrainer:
                     )
                     epoch_loss_D += loss_D.item()
 
-                loss_G = self._train_generator()
-                epoch_loss_G += loss_G.item()
+                if self.features["use_gan"]:
+                    loss_G = self._train_generator()
+                    epoch_loss_G += loss_G.item()
+                else:
+                    loss_G = torch.tensor(
+                        0.0,
+                        device=self.device,
+                    )
 
                 n_batches += 1
 
@@ -276,17 +369,13 @@ class SemiGANTrainer:
 
             epoch_loss_D /= max(
                 1,
-                n_batches * n_critic
+                n_batches * n_critic,
             )
 
             epoch_loss_G /= max(
                 1,
-                n_batches
+                n_batches,
             )
-
-            # ------------------------------------------------------------------
-            # VALIDATION
-            # ------------------------------------------------------------------
 
             val_metrics = evaluate_classifier(
                 model=self.D,
@@ -300,7 +389,6 @@ class SemiGANTrainer:
             results["epoch"].append(epoch + 1)
             results["train_loss_D"].append(epoch_loss_D)
             results["train_loss_G"].append(epoch_loss_G)
-
             results["val_accuracy"].append(
                 val_metrics["accuracy"]
             )
@@ -332,10 +420,6 @@ class SemiGANTrainer:
                 ),
             )
 
-            # ------------------------------------------------------------------
-            # BEST CHECKPOINT
-            # ------------------------------------------------------------------
-
             if val_metrics["f1"] > self.best_val_f1:
                 self.best_val_f1 = val_metrics["f1"]
                 self.best_epoch = epoch + 1
@@ -353,14 +437,11 @@ class SemiGANTrainer:
             if (
                 epoch + 1
             ) % self.config["logging"]["sample_interval"] == 0:
-                self._save_samples(epoch)
+                if self.features["use_gan"]:
+                    self._save_samples(epoch)
 
             if (epoch + 1) % 10 == 0:
                 self._save_checkpoint(epoch)
-
-        # ------------------------------------------------------------------
-        # FINAL TEST
-        # ------------------------------------------------------------------
 
         logger.info("=" * 70)
         logger.info("LOADING BEST CHECKPOINT")
@@ -374,9 +455,10 @@ class SemiGANTrainer:
                 map_location=self.device,
             )
 
-            self.G.load_state_dict(
-                checkpoint["G"]
-            )
+            if self.features["use_gan"]:
+                self.G.load_state_dict(
+                    checkpoint["G"]
+                )
 
             self.D.load_state_dict(
                 checkpoint["D"]
@@ -432,15 +514,43 @@ class SemiGANTrainer:
             ),
         )
 
-        # Save complete experiment results.
         complete_results = {
-            "label_pct": self.label_pct,
+            "experiment": self.experiment,
+            "experiment_description": self.experiment_config[
+                "description"
+            ],
+            "features": self.features,
+            "label_pct_requested": self.label_pct,
+            "actual_labeled_patient_pct": (
+                split_info["actual_patient_pct"]
+            ),
+            "actual_labeled_image_pct": (
+                split_info["actual_image_pct"]
+            ),
+            "labeled_patients": split_info[
+                "n_labeled_patients"
+            ],
+            "unlabeled_patients": split_info[
+                "n_unlabeled_patients"
+            ],
+            "labeled_images": split_info[
+                "n_labeled"
+            ],
+            "unlabeled_images": split_info[
+                "n_unlabeled"
+            ],
             "seed": self.seed,
             "best_epoch": self.best_epoch,
             "best_val_f1": self.best_val_f1,
-            "train_patients": len(split["train_patients"]),
-            "val_patients": len(split["val_patients"]),
-            "test_patients": len(split["test_patients"]),
+            "train_patients": len(
+                split["train_patients"]
+            ),
+            "val_patients": len(
+                split["val_patients"]
+            ),
+            "test_patients": len(
+                split["test_patients"]
+            ),
             "train_images": len(train_indices),
             "val_images": len(val_indices),
             "test_images": len(test_indices),
@@ -451,6 +561,7 @@ class SemiGANTrainer:
         with open(
             self.exp_dir / "results.json",
             "w",
+            encoding="utf-8",
         ) as f:
             json.dump(
                 complete_results,
@@ -462,10 +573,11 @@ class SemiGANTrainer:
 
     def _get_train_label_split(self, dataset):
         """
-        Create a patient-level labeled/unlabeled split inside the
-        training set only.
+        Create a patient-level labeled/unlabeled split inside
+        the training set only.
 
-        Returns integer SAMPLE INDICES, not patient IDs.
+        Returns integer sample indices and explicit budget
+        statistics.
         """
 
         rng = np.random.default_rng(self.seed)
@@ -499,8 +611,8 @@ class SemiGANTrainer:
 
             if len(unique_labels) != 1:
                 raise RuntimeError(
-                    f"Patient {patient_id} contains multiple labels: "
-                    f"{unique_labels}"
+                    f"Patient {patient_id} contains multiple "
+                    f"labels: {unique_labels}"
                 )
 
             patient_labels[patient_id] = labels[0]
@@ -529,6 +641,7 @@ class SemiGANTrainer:
 
             labeled_patients = set()
 
+            # Guarantee representation of every class.
             for class_label in classes:
                 class_patients = [
                     p
@@ -594,20 +707,20 @@ class SemiGANTrainer:
         n_labeled = len(labeled_indices)
         n_unlabeled = len(unlabeled_indices)
 
+        n_labeled_patients = len(
+            labeled_patients
+        )
+        n_unlabeled_patients = (
+            len(patients) - n_labeled_patients
+        )
+
         if n_labeled == 0:
             raise RuntimeError(
                 "Labeled split is empty."
             )
 
-        if n_unlabeled == 0 and self.label_pct < 100:
-            raise RuntimeError(
-                "Unlabeled split is empty."
-            )
-
-        labeled_patient_count = len(labeled_patients)
-
         actual_patient_pct = (
-            labeled_patient_count
+            n_labeled_patients
             / len(patients)
             * 100.0
         )
@@ -625,7 +738,7 @@ class SemiGANTrainer:
 
         logger.info(
             "Labeled patients: %d / %d (%.2f%%)",
-            labeled_patient_count,
+            n_labeled_patients,
             len(patients),
             actual_patient_pct,
         )
@@ -637,18 +750,18 @@ class SemiGANTrainer:
             actual_image_pct,
         )
 
-        logger.info(
-            "Unlabeled images: %d / %d",
-            n_unlabeled,
-            len(dataset.samples),
-        )
-
-        return (
-            labeled_indices,
-            unlabeled_indices,
-            n_labeled,
-            n_unlabeled,
-        )
+        return {
+            "labeled_indices": labeled_indices,
+            "unlabeled_indices": unlabeled_indices,
+            "n_labeled": n_labeled,
+            "n_unlabeled": n_unlabeled,
+            "n_labeled_patients": n_labeled_patients,
+            "n_unlabeled_patients": n_unlabeled_patients,
+            "n_train_patients": len(patients),
+            "n_train_images": len(dataset.samples),
+            "actual_patient_pct": actual_patient_pct,
+            "actual_image_pct": actual_image_pct,
+        }
 
     def _train_discriminator(
         self,
@@ -666,9 +779,11 @@ class SemiGANTrainer:
             self.device
         )
 
-        x_labeled = self.noise_layer(
-            x_labeled
-        )
+        # Noise injection is an E5-only component.
+        if self.features["use_noise_injection"]:
+            x_labeled = self.noise_layer(
+                x_labeled
+            )
 
         self._real_batch_for_g = (
             x_labeled.detach()
@@ -688,110 +803,137 @@ class SemiGANTrainer:
             * loss_supervised
         )
 
-        x_unlabeled = unlabeled_batch[
-            "image"
-        ].to(self.device)
+        # --------------------------------------------------------
+        # Unlabeled objectives: VAT and rotation SSL
+        # --------------------------------------------------------
 
-        x_unlabeled = self.noise_layer(
-            x_unlabeled
-        )
+        if (
+            unlabeled_batch is not None
+            and (
+                self.features["use_vat"]
+                or self.features["use_rotation_ssl"]
+            )
+        ):
+            x_unlabeled = unlabeled_batch[
+                "image"
+            ].to(self.device)
 
-        x_rot, y_rot = create_rotations(
-            x_unlabeled
-        )
+            if self.features["use_noise_injection"]:
+                x_unlabeled = self.noise_layer(
+                    x_unlabeled
+                )
 
-        x_rot = x_rot.to(self.device)
-        y_rot = y_rot.to(self.device)
+            if self.features["use_rotation_ssl"]:
+                x_rot, y_rot = create_rotations(
+                    x_unlabeled
+                )
 
-        (
-            _,
-            rotation_logits,
-            _,
-            _,
-        ) = self.D(
-            x_rot,
-            return_rotation=True,
-        )
+                x_rot = x_rot.to(self.device)
+                y_rot = y_rot.to(self.device)
 
-        loss_rotation = self.rotation_ce(
-            rotation_logits,
-            y_rot,
-        )
+                (
+                    _,
+                    rotation_logits,
+                    _,
+                    _,
+                ) = self.D(
+                    x_rot,
+                    return_rotation=True,
+                )
 
-        loss_D += (
-            self.config["losses"]["rotation_weight"]
-            * loss_rotation
-        )
+                loss_rotation = self.rotation_ce(
+                    rotation_logits,
+                    y_rot,
+                )
 
-        # GAN adversarial loss.
-        z = torch.randn(
-            x_labeled.size(0),
-            self.config["generator"]["z_dim"],
-            device=self.device,
-        )
+                loss_D += (
+                    self.config["losses"][
+                        "rotation_weight"
+                    ]
+                    * loss_rotation
+                )
 
-        fake_images = self.G(z).detach()
+            if self.features["use_vat"]:
 
-        _, fake_logits_fake = self.D(
-            fake_images
-        )
+                def logit_fn(x):
+                    class_logits, _ = self.D(x)
+                    return class_logits
 
-        fake_targets = torch.zeros(
-            x_labeled.size(0),
-            device=self.device,
-        )
+                loss_vat = self.vat(
+                    self.D,
+                    x_unlabeled,
+                    logit_fn,
+                )
 
-        real_targets = torch.ones(
-            x_labeled.size(0),
-            device=self.device,
-        )
+                loss_D += (
+                    self.config["losses"]["vat_weight"]
+                    * loss_vat
+                )
 
-        loss_fake = self.adversarial_loss(
-            fake_logits_fake,
-            fake_targets,
-        )
+        # --------------------------------------------------------
+        # GAN adversarial objective
+        # --------------------------------------------------------
 
-        _, fake_logits_real = self.D(
-            x_labeled
-        )
+        if self.features["use_gan"]:
+            z = torch.randn(
+                x_labeled.size(0),
+                self.config["generator"]["z_dim"],
+                device=self.device,
+            )
 
-        loss_real = self.adversarial_loss(
-            fake_logits_real,
-            real_targets,
-        )
+            fake_images = self.G(z).detach()
 
-        loss_adversarial = (
-            loss_fake + loss_real
-        ) / 2.0
+            _, fake_logits_fake = self.D(
+                fake_images
+            )
 
-        loss_D += (
-            self.config["losses"]["adversarial_weight"]
-            * loss_adversarial
-        )
+            fake_targets = torch.zeros(
+                x_labeled.size(0),
+                device=self.device,
+            )
 
-        # VAT.
-        def logit_fn(x):
-            class_logits, _ = self.D(x)
-            return class_logits
+            real_targets = torch.ones(
+                x_labeled.size(0),
+                device=self.device,
+            )
 
-        loss_vat = self.vat(
-            self.D,
-            x_unlabeled,
-            logit_fn,
-        )
+            loss_fake = self.adversarial_loss(
+                fake_logits_fake,
+                fake_targets,
+            )
 
-        loss_D += (
-            self.config["losses"]["vat_weight"]
-            * loss_vat
-        )
+            _, fake_logits_real = self.D(
+                x_labeled
+            )
+
+            loss_real = self.adversarial_loss(
+                fake_logits_real,
+                real_targets,
+            )
+
+            loss_adversarial = (
+                loss_fake + loss_real
+            ) / 2.0
+
+            loss_D += (
+                self.config["losses"][
+                    "adversarial_weight"
+                ]
+                * loss_adversarial
+            )
 
         loss_D.backward()
-
         self.opt_D.step()
 
         return loss_D
 
     def _train_generator(self):
+        if not self.features["use_gan"]:
+            return torch.tensor(
+                0.0,
+                device=self.device,
+            )
+
         self.G.train()
         self.opt_G.zero_grad()
 
@@ -807,20 +949,9 @@ class SemiGANTrainer:
 
         fake_images = self.G(z)
 
-        with torch.no_grad():
-            real_feat, _, _ = self.D(
-                self._real_batch_for_g,
-                return_features=True,
-            )
-
         fake_feat, _, fake_logits_fake = self.D(
             fake_images,
             return_features=True,
-        )
-
-        loss_feature_match = self.feature_match(
-            fake_feat,
-            real_feat,
         )
 
         real_targets = torch.ones(
@@ -834,15 +965,31 @@ class SemiGANTrainer:
         )
 
         loss_G = (
-            self.config["losses"]["feature_match_weight"]
-            * loss_feature_match
-            +
             self.config["losses"]["adversarial_weight"]
             * loss_adversarial
         )
 
-        loss_G.backward()
+        # Feature matching is E5-only.
+        if self.features["use_feature_matching"]:
+            with torch.no_grad():
+                real_feat, _, _ = self.D(
+                    self._real_batch_for_g,
+                    return_features=True,
+                )
 
+            loss_feature_match = self.feature_match(
+                fake_feat,
+                real_feat,
+            )
+
+            loss_G += (
+                self.config["losses"][
+                    "feature_match_weight"
+                ]
+                * loss_feature_match
+            )
+
+        loss_G.backward()
         self.opt_G.step()
 
         return loss_G
@@ -861,6 +1008,8 @@ class SemiGANTrainer:
             "val_metrics": val_metrics,
             "label_pct": self.label_pct,
             "seed": self.seed,
+            "experiment": self.experiment,
+            "features": self.features,
         }
 
         torch.save(
@@ -875,6 +1024,10 @@ class SemiGANTrainer:
             "D": self.D.state_dict(),
             "opt_G": self.opt_G.state_dict(),
             "opt_D": self.opt_D.state_dict(),
+            "experiment": self.experiment,
+            "features": self.features,
+            "label_pct": self.label_pct,
+            "seed": self.seed,
         }
 
         torch.save(
@@ -927,6 +1080,18 @@ def main():
         default=42,
     )
 
+    parser.add_argument(
+        "--experiment",
+        choices=[
+            "E1_supervised",
+            "E2_semigan",
+            "E3_semigan_vat",
+            "E4_semigan_vat_rotation",
+            "E5_full",
+        ],
+        default="E5_full",
+    )
+
     args = parser.parse_args()
 
     trainer = SemiGANTrainer(
@@ -934,6 +1099,7 @@ def main():
         args.exp,
         args.label_pct,
         args.seed,
+        args.experiment,
     )
 
     dataset = BreakHisDataset(
