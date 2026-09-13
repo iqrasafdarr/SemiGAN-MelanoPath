@@ -1,14 +1,12 @@
-﻿from pathlib import Path
+﻿from __future__ import annotations
+
 import argparse
-import copy
 import json
 import subprocess
 import sys
+from pathlib import Path
 
 import yaml
-
-
-CONFIG_PATH = Path("experiments/experiment_configs.yaml")
 
 
 EXPERIMENTS = [
@@ -20,81 +18,60 @@ EXPERIMENTS = [
 ]
 
 
+ROOT = Path(__file__).resolve().parents[1]
+CONFIG_PATH = ROOT / "experiments" / "experiment_configs.yaml"
+
+
 def load_matrix():
-    with CONFIG_PATH.open("r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+    with CONFIG_PATH.open("r", encoding="utf-8") as handle:
+        return yaml.safe_load(handle)
 
 
 def load_experiment_config(experiment_name):
-    config = load_matrix()
-    experiments = config["experiments"]
+    matrix = load_matrix()
+    experiments = matrix["experiments"]
 
     if experiment_name not in experiments:
-        available = ", ".join(experiments.keys())
         raise ValueError(
-            f"Unknown experiment '{experiment_name}'. "
-            f"Available experiments: {available}"
+            f"Unknown experiment: {experiment_name}. "
+            f"Expected one of: {EXPERIMENTS}"
         )
 
-    experiment = copy.deepcopy(
-        experiments[experiment_name]
-    )
-
-    return {
-        "name": experiment_name,
-        "description": experiment["description"],
-        "features": experiment,
-        "label_budgets": config["label_budgets"],
-        "seeds": config["seeds"],
-        "dataset": config["dataset"],
-    }
+    return matrix, experiments[experiment_name]
 
 
-def build_run_config(experiment_name, label_pct, seed):
-    config = load_experiment_config(experiment_name)
-
-    if label_pct not in config["label_budgets"]:
-        raise ValueError(
-            f"Label budget {label_pct}% is not configured. "
-            f"Available: {config['label_budgets']}"
-        )
-
-    return {
-        "experiment": config["name"],
-        "description": config["description"],
-        "label_pct_requested": label_pct,
-        "seed": seed,
-        "dataset": config["dataset"],
-        "features": {
-            "use_gan": config["features"]["use_gan"],
-            "use_vat": config["features"]["use_vat"],
-            "use_rotation_ssl": config["features"]["use_rotation_ssl"],
-            "use_feature_matching": config["features"]["use_feature_matching"],
-            "use_noise_injection": config["features"]["use_noise_injection"],
-        },
-    }
+def get_run_name(experiment_name, label_pct, seed):
+    return f"{experiment_name}_lbl{label_pct}_s{seed}"
 
 
 def get_run_dir(experiment_name, label_pct, seed):
-    return (
-        Path("runs")
-        / experiment_name
-        / f"label_{label_pct}pct"
-        / f"seed_{seed}"
-    )
-
-
-def save_run_config(
-    experiment_name,
-    label_pct,
-    seed,
-):
-    run_config = build_run_config(
+    return ROOT / "runs" / get_run_name(
         experiment_name,
         label_pct,
         seed,
     )
 
+
+def build_run_config(experiment_name, label_pct, seed):
+    matrix, experiment = load_experiment_config(experiment_name)
+
+    return {
+        "experiment": experiment_name,
+        "description": experiment["description"],
+        "label_pct_requested": label_pct,
+        "seed": seed,
+        "dataset": matrix["dataset"],
+        "features": {
+            "use_gan": experiment["use_gan"],
+            "use_vat": experiment["use_vat"],
+            "use_rotation_ssl": experiment["use_rotation_ssl"],
+            "use_feature_matching": experiment["use_feature_matching"],
+            "use_noise_injection": experiment["use_noise_injection"],
+        },
+    }
+
+
+def save_run_config(experiment_name, label_pct, seed):
     run_dir = get_run_dir(
         experiment_name,
         label_pct,
@@ -108,55 +85,45 @@ def save_run_config(
 
     config_path = run_dir / "config.json"
 
-    with config_path.open(
-        "w",
-        encoding="utf-8",
-    ) as f:
+    config = build_run_config(
+        experiment_name,
+        label_pct,
+        seed,
+    )
+
+    with config_path.open("w", encoding="utf-8") as handle:
         json.dump(
-            run_config,
-            f,
+            config,
+            handle,
             indent=2,
         )
 
-    return run_config, config_path
+    return config_path
 
 
 def validate_matrix():
-    config = load_matrix()
+    matrix = load_matrix()
 
-    experiments = config["experiments"]
-    label_budgets = config["label_budgets"]
-    seeds = config["seeds"]
+    experiments = list(matrix["experiments"].keys())
+    label_budgets = matrix["label_budgets"]
+    seeds = matrix["seeds"]
 
-    assert len(experiments) == 5
-    assert set(experiments.keys()) == set(
-        EXPERIMENTS
-    )
+    if experiments != EXPERIMENTS:
+        raise ValueError(
+            f"Experiment matrix mismatch.\n"
+            f"Expected: {EXPERIMENTS}\n"
+            f"Found: {experiments}"
+        )
 
-    assert label_budgets == [
-        1,
-        5,
-        10,
-        20,
-        100,
-    ]
+    if label_budgets != [1, 5, 10, 20, 100]:
+        raise ValueError(
+            f"Unexpected label budgets: {label_budgets}"
+        )
 
-    assert seeds == [42]
-
-    for experiment_name in EXPERIMENTS:
-        experiment = experiments[experiment_name]
-
-        required_keys = [
-            "description",
-            "use_gan",
-            "use_vat",
-            "use_rotation_ssl",
-            "use_feature_matching",
-            "use_noise_injection",
-        ]
-
-        for key in required_keys:
-            assert key in experiment
+    if seeds != [42]:
+        raise ValueError(
+            f"Unexpected seeds: {seeds}"
+        )
 
     total_runs = (
         len(experiments)
@@ -164,7 +131,6 @@ def validate_matrix():
         * len(seeds)
     )
 
-    print("")
     print("=" * 70)
     print("EXPERIMENT MATRIX")
     print("=" * 70)
@@ -174,44 +140,53 @@ def validate_matrix():
     print(f"Total planned runs: {total_runs}")
     print("")
 
-    for name in EXPERIMENTS:
+    for name in experiments:
         print(
             f"{name}: "
-            f"{experiments[name]['description']}"
+            f"{matrix['experiments'][name]['description']}"
         )
 
     print("")
     print("MATRIX VALIDATION PASSED")
 
 
-def dry_run(
-    experiment_name,
-    label_pct,
-    seed,
-):
-    _, config_path = save_run_config(
-        experiment_name,
-        label_pct,
-        seed,
-    )
-
-    print("")
-    print("DRY RUN PASSED")
-    print(f"Configuration: {config_path}")
-
-
-def run_training(
-    experiment_name,
-    label_pct,
-    seed,
-):
-    run_config, config_path = save_run_config(
+def dry_run(experiment_name, label_pct, seed):
+    config_path = save_run_config(
         experiment_name,
         label_pct,
         seed,
     )
 
     run_dir = get_run_dir(
+        experiment_name,
+        label_pct,
+        seed,
+    )
+
+    print("")
+    print("=" * 70)
+    print("DRY RUN PASSED")
+    print("=" * 70)
+    print(f"Experiment: {experiment_name}")
+    print(f"Label budget: {label_pct}%")
+    print(f"Seed: {seed}")
+    print(f"Run directory: {run_dir}")
+    print(f"Configuration: {config_path}")
+
+
+def run_training(experiment_name, label_pct, seed):
+    run_dir = get_run_dir(
+        experiment_name,
+        label_pct,
+        seed,
+    )
+
+    run_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    config_path = save_run_config(
         experiment_name,
         label_pct,
         seed,
@@ -225,7 +200,7 @@ def run_training(
         "--config",
         "configs/default.yaml",
         "--exp",
-        run_dir.as_posix(),
+        experiment_name,
         "--label_pct",
         str(label_pct),
         "--seed",
@@ -250,20 +225,23 @@ def run_training(
     with log_path.open(
         "w",
         encoding="utf-8",
-    ) as log_file:
+    ) as log_handle:
 
         process = subprocess.Popen(
             command,
+            cwd=ROOT,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
         )
 
+        assert process.stdout is not None
+
         for line in process.stdout:
             print(line, end="")
-            log_file.write(line)
-            log_file.flush()
+            log_handle.write(line)
+            log_handle.flush()
 
         return_code = process.wait()
 
@@ -274,6 +252,16 @@ def run_training(
             f"See {log_path}"
         )
 
+    expected_results = run_dir / "results.json"
+
+    # train.py uses the same canonical directory naming.
+    # Verify that the expected research artifact exists.
+    if not expected_results.exists():
+        raise RuntimeError(
+            "Training finished but results.json was not found at "
+            f"{expected_results}"
+        )
+
     print("")
     print("=" * 70)
     print("EXPERIMENT COMPLETED")
@@ -281,13 +269,12 @@ def run_training(
     print(f"Results directory: {run_dir}")
     print(f"Training log: {log_path}")
     print(f"Config: {config_path}")
+    print(f"Results: {expected_results}")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description=(
-            "SemiGAN-MelanoPath experiment runner"
-        )
+        description="SemiGAN-MelanoPath experiment runner"
     )
 
     parser.add_argument(
