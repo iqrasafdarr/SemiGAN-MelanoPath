@@ -1,4 +1,4 @@
-﻿import os
+import os
 import re
 import numpy as np
 import torch
@@ -20,39 +20,81 @@ class BreakHisDataset(Dataset):
         self.transform = transform or self._default_transform()
         self.split = split
         self.samples = []
-        
+
         if not os.path.exists(root_dir):
             logger.warning(f"BreakHis not found at {root_dir}. Using dummy dataset.")
             self.samples = self._create_dummy_samples(500)
             return
-        
-        # Parse BreakHis structure: SOB_B_A-14-13411B/40X/SOB_B_A-14-13411B-20150629132155.png
-        for patient_dir in os.listdir(root_dir):
-            patient_path = os.path.join(root_dir, patient_dir)
-            if not os.path.isdir(patient_path):
+
+        # Actual BreakHis structure:
+        #
+        # breast/
+        #   benign/
+        #       SOB/
+        #           adenosis/
+        #               SOB_B_.../
+        #                   40X/*.png
+        #                   100X/*.png
+        #                   200X/*.png
+        #                   400X/*.png
+        #
+        #   malignant/
+        #       SOB/
+        #           ductal_carcinoma/
+        #               SOB_M_.../
+        #                   40X/*.png
+        #
+        # We recursively search the class directories so the
+        # intermediate histological subtype directory is handled.
+
+        class_roots = [
+            ("benign", 0),
+            ("malignant", 1),
+        ]
+
+        for class_name, label in class_roots:
+            class_root = os.path.join(root_dir, class_name, "SOB")
+
+            if not os.path.isdir(class_root):
+                logger.warning(
+                    f"BreakHis class directory not found: {class_root}"
+                )
                 continue
-            
-            # Extract patient ID (e.g., "SOB_B_A-14-13411B" from folder name)
-            patient_id = patient_dir.split('/')[0]
-            label = 0 if patient_id.startswith('SOB_B_') else 1  # B=benign, M=malignant
-            
-            for mag in ['40X', '100X', '200X', '400X']:
-                mag_dir = os.path.join(patient_path, mag)
-                if not os.path.isdir(mag_dir):
-                    continue
-                
-                for img_file in os.listdir(mag_dir):
-                    if img_file.endswith('.png'):
-                        img_path = os.path.join(mag_dir, img_file)
-                        self.samples.append({
-                            'path': img_path,
-                            'label': label,
-                            'patient_id': patient_id
-                        })
-        
+
+            for current_root, _, files in os.walk(class_root):
+                for img_file in files:
+                    if not img_file.lower().endswith(('.png', '.jpg', '.jpeg')):
+                        continue
+
+                    img_path = os.path.join(current_root, img_file)
+
+                    # Patient directory is two levels below the subtype:
+                    # SOB/<subtype>/<patient>/<magnification>/<image>
+                    relative_path = os.path.relpath(img_path, class_root)
+                    parts = relative_path.split(os.sep)
+
+                    if len(parts) >= 4:
+                        patient_id = parts[1]
+                    else:
+                        # Fallback: use the nearest parent directory.
+                        patient_id = os.path.basename(
+                            os.path.dirname(current_root)
+                        )
+
+                    self.samples.append({
+                        'path': img_path,
+                        'label': label,
+                        'patient_id': patient_id
+                    })
+
+        logger.info(
+            f"Loaded BreakHis: {len(self.samples)} images, "
+            f"{len(set(s['patient_id'] for s in self.samples))} patients"
+        )
+
         if indices is not None:
             self.samples = [self.samples[i] for i in indices]
-    
+
     def _create_dummy_samples(self, n_samples):
         """Create dummy samples for testing when real data unavailable."""
         samples = []
@@ -168,83 +210,100 @@ class MHISTDataset(Dataset):
 
 def get_train_val_split(dataset, label_pct=100, seed=42):
     """
-    Patient-level labeled/unlabeled split with class-balanced sampling.
+    Create a patient-level labeled/unlabeled split.
 
-    Every patient remains entirely in either the labeled or unlabeled set.
-    For label_pct < 100, patients are sampled independently within each
-    class so both benign and malignant classes are represented.
+    The split is performed entirely at the patient level to prevent
+    image-level leakage between labeled and unlabeled subsets.
+
+    For extreme label scarcity, the percentage is interpreted as a
+    target patient-level budget. Because BreakHis contains a finite
+    number of patients, at least one patient from each class is retained
+    when a non-zero label percentage is requested.
     """
+    if not 0 < label_pct <= 100:
+        raise ValueError("label_pct must be in the range (0, 100].")
+
     samples = dataset.samples
 
-    if label_pct >= 100:
-        labeled_indices = np.arange(len(samples), dtype=int)
-        return {
-            'labeled_indices': labeled_indices,
-            'unlabeled_indices': np.array([], dtype=int),
-            'n_labeled': len(labeled_indices),
-            'n_unlabeled': 0
-        }
+    if not samples:
+        raise ValueError("Dataset contains no samples.")
 
-    patient_to_indices = {}
+    patient_ids = np.array([s["patient_id"] for s in samples])
+    labels = np.array([s["label"] for s in samples])
 
-    for idx, sample in enumerate(samples):
-        patient_to_indices.setdefault(sample['patient_id'], []).append(idx)
+    unique_patients = np.unique(patient_ids)
+    patient_labels = np.array([
+        labels[patient_ids == patient][0]
+        for patient in unique_patients
+    ])
 
-    patient_to_label = {
-        patient_id: samples[indices[0]]['label']
-        for patient_id, indices in patient_to_indices.items()
-    }
+    # 100% means every patient is labeled.
+    if label_pct == 100:
+        labeled_patients = unique_patients
+        unlabeled_patients = np.array([], dtype=unique_patients.dtype)
 
-    rng = np.random.RandomState(seed)
+    else:
+        rng = np.random.RandomState(seed)
 
-    labeled_patients = set()
-    unlabeled_patients = set()
+        classes = np.unique(patient_labels)
 
-    for label in sorted(set(patient_to_label.values())):
+        # Target number of labeled patients.
+        target_n = max(
+            1,
+            int(round(len(unique_patients) * label_pct / 100.0))
+        )
 
-        class_patients = [
-            patient_id
-            for patient_id, patient_label in patient_to_label.items()
-            if patient_label == label
+        # At extreme scarcity, preserve representation from every class.
+        min_required = len(classes)
+
+        if target_n < min_required:
+            target_n = min_required
+
+        selected = []
+
+        # Select one patient from each class first.
+        for cls in classes:
+            candidates = np.where(patient_labels == cls)[0]
+            selected.append(rng.choice(candidates))
+
+        selected = list(dict.fromkeys(selected))
+
+        # Fill remaining patient budget using a shuffled pool.
+        remaining = [
+            idx for idx in range(len(unique_patients))
+            if idx not in selected
         ]
+        rng.shuffle(remaining)
 
-        rng.shuffle(class_patients)
+        if len(selected) < target_n:
+            selected.extend(
+                remaining[:target_n - len(selected)]
+            )
 
-        n_labeled = int(round(len(class_patients) * label_pct / 100))
+        labeled_patient_indices = np.array(
+            selected,
+            dtype=int
+        )
 
-        # At least one patient from each class.
-        n_labeled = max(1, n_labeled)
+        labeled_patients = unique_patients[labeled_patient_indices]
+        unlabeled_patients = np.array([
+            patient
+            for patient in unique_patients
+            if patient not in set(labeled_patients)
+        ])
 
-        # Keep at least one patient in the unlabeled pool.
-        if len(class_patients) > 1:
-            n_labeled = min(n_labeled, len(class_patients) - 1)
+    labeled_mask = np.isin(patient_ids, labeled_patients)
+    unlabeled_mask = np.isin(patient_ids, unlabeled_patients)
 
-        labeled_patients.update(class_patients[:n_labeled])
-        unlabeled_patients.update(class_patients[n_labeled:])
-
-    labeled_indices = np.array(
-        [
-            idx for idx, sample in enumerate(samples)
-            if sample['patient_id'] in labeled_patients
-        ],
-        dtype=int
-    )
-
-    unlabeled_indices = np.array(
-        [
-            idx for idx, sample in enumerate(samples)
-            if sample['patient_id'] in unlabeled_patients
-        ],
-        dtype=int
-    )
+    labeled_indices = np.where(labeled_mask)[0]
+    unlabeled_indices = np.where(unlabeled_mask)[0]
 
     return {
-        'labeled_indices': labeled_indices,
-        'unlabeled_indices': unlabeled_indices,
-        'n_labeled': len(labeled_indices),
-        'n_unlabeled': len(unlabeled_indices)
+        "labeled_indices": labeled_indices,
+        "unlabeled_indices": unlabeled_indices,
+        "n_labeled": len(labeled_indices),
+        "n_unlabeled": len(unlabeled_indices),
     }
-
 
 def create_loaders(dataset, labeled_indices, unlabeled_indices, batch_size=32):
     """Create DataLoaders for labeled and unlabeled subsets."""
@@ -268,4 +327,3 @@ def create_loaders(dataset, labeled_indices, unlabeled_indices, batch_size=32):
     )
     
     return labeled_loader, unlabeled_loader
-

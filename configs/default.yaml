@@ -1,20 +1,24 @@
 seed: 42
 cuda_deterministic: true
+
 data:
-  breakhis_root: ./data/BreakHis
+  breakhis_root: D:\archive (1)\BreaKHis_v1\histology_slides\breast
   mhist_root: ./data/MHIST
   image_size: 128
   n_channels: 3
   num_classes: 2
+
 generator:
   z_dim: 100
   base_channels: 32
   spectral_norm: true
+
 discriminator:
   base_channels: 32
   spectral_norm: true
   classifier_dropout: 0.5
   num_rotations: 4
+
 losses:
   supervised_weight: 1.0
   rotation_weight: 0.5
@@ -24,27 +28,22 @@ losses:
   vat_beta: 0.1
   feature_match_weight: 10.0
   noise_sigma: 0.05
+
 optimizer:
   type: Adam
-  lr: 0.0002
-  betas:
-  - 0.5
-  - 0.999
-  d_weight_decay: 0.0001
+  lr: 2.0e-4
+  betas: [0.5, 0.999]
+  d_weight_decay: 1.0e-4
   g_weight_decay: 0.0
+
 training:
   num_epochs: 100
   batch_size: 32
   n_critic: 1
-label_percentages:
-- 100
-- 25
-- 10
-- 1
-seeds:
-- 42
-- 123
-- 456
+
+label_percentages: [100, 25, 10, 1]
+seeds: [42, 123, 456]
+
 logging:
   sample_interval: 5
   eval_interval: 1

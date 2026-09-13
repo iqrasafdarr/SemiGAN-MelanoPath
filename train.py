@@ -196,6 +196,9 @@ class SemiGANTrainer:
         y_labeled = labeled_batch['label'].to(self.device)
         
         x_labeled = self.noise_layer(x_labeled)
+
+        # Keep the real image batch for generator feature matching.
+        self._real_batch_for_g = x_labeled.detach()
         class_logits, fake_logits = self.D(x_labeled)
         
         loss_supervised = self.supervised_ce(class_logits, y_labeled)
@@ -210,7 +213,7 @@ class SemiGANTrainer:
         x_rot = x_rot.to(self.device)
         y_rot = y_rot.to(self.device)
         
-        class_logits_rot, rotation_logits, _ = self.D(
+        class_logits_rot, rotation_logits, _, _ = self.D(
             x_rot, return_rotation=True
         )
         loss_rotation = self.rotation_ce(rotation_logits, y_rot)
@@ -251,13 +254,18 @@ class SemiGANTrainer:
                        self.config['generator']['z_dim']).to(self.device)
         fake_images = self.G(z)
         
-        # Feature matching
+        # Feature matching: compare generated features with real image features.
         with torch.no_grad():
-            x_real = torch.randn_like(fake_images)  # Placeholder real data
-        
-        fake_feat, _, fake_logits_fake = self.D(fake_images, return_features=True)
-        
-        loss_feature_match = self.feature_match(fake_feat, fake_feat)
+            real_feat, _, _ = self.D(
+                self._real_batch_for_g,
+                return_features=True
+            )
+
+        fake_feat, _, fake_logits_fake = self.D(
+            fake_images,
+            return_features=True
+        )
+        loss_feature_match = self.feature_match(fake_feat, real_feat)
         
         # Adversarial loss
         loss_adversarial = self.adversarial_loss(fake_logits_fake, torch.ones(z.size(0)))
@@ -306,7 +314,7 @@ def main():
     trainer = SemiGANTrainer(args.config, args.exp, args.label_pct, args.seed)
     
     dataset = BreakHisDataset(
-        root_dir='./data/BreakHis',
+        root_dir=trainer.config['data']['breakhis_root'],
         transform=None
     )
     
@@ -322,3 +330,6 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+

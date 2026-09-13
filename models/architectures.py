@@ -1,4 +1,4 @@
-import torch
+﻿import torch
 import torch.nn as nn
 import torch.nn.utils.spectral_norm as spectral_norm
 
@@ -26,7 +26,7 @@ class Generator(nn.Module):
         super().__init__()
         self.z_dim = z_dim
         self.base_channels = base_channels
-        
+
         self.fc = nn.Linear(z_dim, base_channels * 8 * 4 * 4)
         
         self.conv_layers = nn.Sequential(
@@ -62,7 +62,7 @@ class Generator(nn.Module):
     
     def forward(self, z):
         x = self.fc(z)
-        x = x.view(-1, self.base_channels * 8, 4, 4)
+        x = x.view(-1, self.base_channels * 8, 4, 4)  # Reshape to 4D
         x = self.conv_layers(x)
         return x
 
@@ -245,3 +245,8 @@ class Discriminator(nn.Module):
             return feat, class_logits, fake_logits
         
         return class_logits, fake_logits
+
+
+
+
+
